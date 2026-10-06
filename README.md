@@ -34,3 +34,12 @@ npm run contract:emit
 ```
 
 To use the framework's development server directly, run `npm run dev`. This direct mode requires `DATABASE_URL`.
+
+## Auth
+
+Better Auth persists users, sessions, accounts and verifications through the custom adapter in `src/lib/auth/prisma8-adapter.ts`. To check the adapter end to end against a real database (it cleans up after itself):
+
+```bash
+DATABASE_URL=postgresql://... npx prisma db init   # once, on an empty database
+DATABASE_URL=postgresql://... npm run auth:verify
+```

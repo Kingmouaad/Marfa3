@@ -4,3 +4,4 @@ dist/
 /.alchemy
 /.prisma-composer
 .next/
+*.tsbuildinfo
