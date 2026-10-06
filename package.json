@@ -5,6 +5,7 @@
   "packageManager": "npm@11.6.0",
   "type": "module",
   "scripts": {
+    "auth:verify": "tsx scripts/verify-auth-adapter.ts",
     "build": "next build",
     "composer:deploy": "prisma deploy module.ts",
     "composer:dev": "prisma dev module.ts",

@@ -1,20 +1,25 @@
 import type { BetterAuthOptions } from "better-auth";
 import {
   createAdapterFactory,
+  type AdapterFactoryOptions,
   type DBAdapterDebugLogOption,
   type Where,
 } from "better-auth/adapters";
 import { and, or } from "@prisma/orm-postgres/orm-client";
 import type { db as DbClient } from "@/prisma/db";
 
-type Orm = typeof DbClient.orm;
+type Db = typeof DbClient;
+type Orm = Db["orm"];
 
 type Prisma8AdapterConfig = {
   usePlural?: boolean;
   debugLogs?: DBAdapterDebugLogOption;
   namespace?: string;
+  /** Run Better Auth's multi-statement flows (e.g. sign-up) atomically. Defaults to true. */
+  transaction?: boolean;
 };
 
+type Row = Record<string, unknown>;
 type FieldFns = Record<string, ((value?: unknown) => unknown) | undefined>;
 type Fields = Record<string, FieldFns | undefined>;
 
@@ -24,13 +29,13 @@ type Query = {
   orderBy: (fn: (fields: Fields) => unknown) => Query;
   limit: (n: number) => Query;
   offset: (n: number) => Query;
-  create: (data: unknown) => Promise<Record<string, unknown>>;
-  first: () => Promise<Record<string, unknown> | null>;
-  all: () => PromiseLike<Record<string, unknown>[]>;
+  create: (data: unknown) => Promise<Row>;
+  first: () => Promise<Row | null>;
+  all: () => PromiseLike<Row[]>;
   aggregate: (fn: (a: { count: () => unknown }) => {
     total: unknown;
   }) => Promise<{ total: number }>;
-  update: (data: unknown) => Promise<Record<string, unknown> | null>;
+  update: (data: unknown) => Promise<Row | null>;
   updateAndCount: (data: unknown) => Promise<number>;
   delete: () => Promise<unknown>;
   deleteAndCount: () => Promise<number>;
@@ -48,32 +53,12 @@ function call(field: FieldFns | undefined, method: string, value?: unknown) {
   return fn(value);
 }
 
+// Better Auth converts scalar Dates itself (supportsDates: false); this covers
+// Dates inside `in` / `not_in` arrays, which the factory passes through as-is.
 function toDbValue(value: unknown): unknown {
   if (value instanceof Date) return value.toISOString();
   if (Array.isArray(value)) return value.map(toDbValue);
   return value;
-}
-
-function fromDbValue(value: unknown): unknown {
-  if (
-    typeof value === "string" &&
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)
-  ) {
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime())) return date;
-  }
-  return value;
-}
-
-function mapRow(row: Record<string, unknown> | null) {
-  if (!row) return null;
-  return Object.fromEntries(
-    Object.entries(row).map(([key, value]) => [key, fromDbValue(value)]),
-  );
-}
-
-function mapRows(rows: Record<string, unknown>[]) {
-  return rows.map((row) => mapRow(row)!);
 }
 
 /** Better Auth AND-group + OR-group semantics → Prisma 8 predicates. */
@@ -113,13 +98,15 @@ export function prismaWhere(fields: Fields, where: readonly Where[] = []) {
     .map(condition);
 
   return and(
-    ...conjunction,
-    ...(disjunction.length ? [or(...disjunction)] : []),
+    ...(conjunction as Parameters<typeof and>),
+    ...(disjunction.length
+      ? [or(...(disjunction as Parameters<typeof or>))]
+      : []),
   );
 }
 
 function resolveModel(
-  db: Pick<typeof DbClient, "orm" | "contract">,
+  db: Pick<Db, "contract">,
   name: string,
   config: Prisma8AdapterConfig,
 ): { namespace: string; model: string } {
@@ -166,120 +153,157 @@ function getCollection(
   return collection;
 }
 
+function createAdapter(
+  db: Pick<Db, "contract">,
+  orm: Orm,
+  config: Prisma8AdapterConfig,
+): AdapterFactoryOptions["adapter"] {
+  return ({ getFieldName }) => {
+    const collection = (model: string) =>
+      getCollection(orm, resolveModel(db, model, config));
+
+    // Always attach a `.where()`: Prisma 8 write terminals require one, and an
+    // empty Better Auth `where` means "every row" (`and()` with no operands).
+    const query = (model: string, where: readonly Where[] = []) =>
+      collection(model).where((fields) =>
+        prismaWhere(
+          fields,
+          where.map((w) => ({
+            ...w,
+            field: getFieldName({ model, field: w.field }),
+          })),
+        ),
+      );
+
+    const selectQuery = (q: Query, model: string, select?: string[]) =>
+      select?.length
+        ? q.select(...select.map((field) => getFieldName({ model, field })))
+        : q;
+
+    return {
+      async create({ model, data, select }) {
+        return (await selectQuery(collection(model), model, select).create(
+          data,
+        )) as typeof data;
+      },
+
+      async findOne<T>({
+        model,
+        where,
+        select,
+      }: {
+        model: string;
+        where: Where[];
+        select?: string[];
+      }) {
+        return (await selectQuery(
+          query(model, where),
+          model,
+          select,
+        ).first()) as T | null;
+      },
+
+      async findMany<T>({
+        model,
+        where,
+        limit,
+        offset,
+        sortBy,
+        select,
+      }: {
+        model: string;
+        where?: Where[];
+        limit: number;
+        select?: string[];
+        sortBy?: { field: string; direction: "asc" | "desc" };
+        offset?: number;
+      }) {
+        let q = selectQuery(query(model, where), model, select);
+        if (sortBy) {
+          const field = getFieldName({ model, field: sortBy.field });
+          q = q.orderBy((fields) =>
+            call(fields[field], sortBy.direction === "desc" ? "desc" : "asc"),
+          );
+        }
+        q = q.limit(limit);
+        if (offset) q = q.offset(offset);
+        return (await q.all()) as T[];
+      },
+
+      async count({ model, where }) {
+        const result = await query(model, where).aggregate((a) => ({
+          total: a.count(),
+        }));
+        return result.total;
+      },
+
+      async update<T>({
+        model,
+        where,
+        update,
+      }: {
+        model: string;
+        where: Where[];
+        update: T;
+      }) {
+        return (await query(model, where).update(update)) as T | null;
+      },
+
+      updateMany: ({ model, where, update }) =>
+        query(model, where).updateAndCount(update),
+
+      async delete({ model, where }) {
+        await query(model, where).delete();
+      },
+
+      deleteMany: ({ model, where }) => query(model, where).deleteAndCount(),
+
+      options: config,
+    };
+  };
+}
+
 export function prisma8Adapter(
-  db: Pick<typeof DbClient, "orm" | "contract" | "transaction">,
+  db: Pick<Db, "orm" | "contract" | "transaction">,
   config: Prisma8AdapterConfig = {},
 ) {
-  return (options: BetterAuthOptions) =>
-    createAdapterFactory({
-      config: {
-        adapterId: "prisma-8",
-        adapterName: "Prisma 8 Adapter",
-        usePlural: config.usePlural ?? false,
-        debugLogs: config.debugLogs ?? false,
-        supportsJSON: true,
-        supportsArrays: true,
-        supportsDates: true,
-        supportsBooleans: true,
-        supportsUUIDs: true,
-        supportsNumericIds: false,
-        transaction: false,
-      },
-      adapter: ({ getFieldName }) => {
-        const query = (model: string, where?: Where[]) => {
-          const coordinate = resolveModel(db, model, config);
-          const collection = getCollection(db.orm, coordinate);
-          if (!where?.length) return collection;
-          return collection.where((fields) =>
-            prismaWhere(
-              fields,
-              where.map((w) => ({
-                ...w,
-                field: getFieldName({ model, field: w.field }),
-                value: toDbValue(w.value) as Where["value"],
-              })),
-            ),
-          );
-        };
+  let lazyOptions: BetterAuthOptions | null = null;
 
-        const selectQuery = (q: Query, model: string, select?: string[]) =>
-          select?.length
-            ? q.select(
-                ...select.map((field) => getFieldName({ model, field })),
-              )
-            : q;
-
-        return {
-          async create({ model, data, select }) {
-            return mapRow(
-              await selectQuery(query(model), model, select).create(
-                Object.fromEntries(
-                  Object.entries(data as Record<string, unknown>).map(
-                    ([k, v]) => [k, toDbValue(v)],
-                  ),
-                ),
-              ),
-            ) as typeof data;
-          },
-
-          async findOne({ model, where, select }) {
-            return mapRow(
-              await selectQuery(query(model, where), model, select).first(),
-            );
-          },
-
-          async findMany({ model, where, limit, offset, sortBy, select }) {
-            let q = selectQuery(query(model, where), model, select).limit(
-              limit,
-            );
-            if (offset) q = q.offset(offset);
-            if (sortBy) {
-              const field = getFieldName({ model, field: sortBy.field });
-              q = q.orderBy((fields) =>
-                call(
-                  fields[field],
-                  sortBy.direction === "desc" ? "desc" : "asc",
-                ),
-              );
-            }
-            return mapRows(await q.all());
-          },
-
-          async count({ model, where }) {
-            const result = await query(model, where).aggregate((a) => ({
-              total: a.count(),
-            }));
-            return result.total;
-          },
-
-          async update({ model, where, update }) {
-            return mapRow(
-              await query(model, where).update(
-                Object.fromEntries(
-                  Object.entries(update as Record<string, unknown>).map(
-                    ([k, v]) => [k, toDbValue(v)],
-                  ),
-                ),
-              ),
-            );
-          },
-
-          updateMany: async ({ model, where, update }) =>
-            query(model, where).updateAndCount(
-              Object.fromEntries(
-                Object.entries(update).map(([k, v]) => [k, toDbValue(v)]),
+  const factoryConfig: AdapterFactoryOptions["config"] = {
+    adapterId: "prisma-8",
+    adapterName: "Prisma 8 Adapter",
+    usePlural: config.usePlural ?? false,
+    debugLogs: config.debugLogs ?? false,
+    // The contract has no JSON or array columns; let Better Auth serialise them.
+    supportsJSON: false,
+    supportsArrays: false,
+    // Timestamp columns use the `TimestamptzString` codec (strings in and out),
+    // so Better Auth converts Date <-> string using its own field types.
+    supportsDates: false,
+    supportsBooleans: true,
+    supportsUUIDs: true,
+    supportsNumericIds: false,
+    transaction:
+      config.transaction === false
+        ? false
+        : (cb) =>
+            db.transaction((tx) =>
+              cb(
+                createAdapterFactory({
+                  config: { ...factoryConfig, transaction: false },
+                  adapter: createAdapter(db, tx.orm as Orm, config),
+                })(lazyOptions!),
               ),
             ),
+  };
 
-          async delete({ model, where }) {
-            await query(model, where).delete();
-          },
+  const adapter = createAdapterFactory({
+    config: factoryConfig,
+    adapter: createAdapter(db, db.orm, config),
+  });
 
-          deleteMany: async ({ model, where }) =>
-            query(model, where).deleteAndCount(),
-
-          options: config,
-        };
-      },
-    })(options);
+  return (options: BetterAuthOptions) => {
+    lazyOptions = options;
+    return adapter(options);
+  };
 }
